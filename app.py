@@ -5,7 +5,15 @@ import plotly.graph_objects as go
 import feedparser
 from datetime import datetime
 
-# --- Constants & Configuration ---
+# --- SETTING A USER AGENT (The Secret Sauce) ---
+# This prevents Yahoo from seeing the request as a 'bot'
+import requests
+session = requests.Session()
+session.headers.update({
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+})
+
+# --- Constants ---
 NIFTY_50_TICKERS = [
     "ADANIENT.NS", "ADANIPORTS.NS", "APOLLOHOSP.NS", "ASIANPAINT.NS", "AXISBANK.NS",
     "BAJAJ-AUTO.NS", "BAJFINANCE.NS", "BAJAJFINSV.NS", "BPCL.NS", "BHARTIARTL.NS",
@@ -21,76 +29,70 @@ NIFTY_50_TICKERS = [
 
 st.set_page_config(page_title="Macro Pulse", layout="wide")
 
-# --- Data Fetching Logic ---
-@st.cache_data(ttl=3600)
-def get_market_breadth():
-    """Calculates Advance/Decline ratio from Nifty 50 stocks."""
-    advances, declines = 0, 0
-    # Fetching only the last 2 days of data for the 50 tickers
-    data = yf.download(NIFTY_50_TICKERS, period="2d", group_by='ticker', silent=True)
-    
-    for ticker in NIFTY_50_TICKERS:
-        try:
-            prev_close = data[ticker]['Close'].iloc[0]
-            curr_close = data[ticker]['Close'].iloc[-1]
-            if curr_close > prev_close:
+# --- Optimized Data Fetching ---
+@st.cache_data(ttl=1800) # 30-minute cache to reduce hits
+def get_data_safely():
+    try:
+        # Fetching ALL data in ONE go (Batching)
+        tickers_to_fetch = NIFTY_50_TICKERS + ["^NSEI", "INR=X", "BZ=F"]
+        data = yf.download(tickers_to_fetch, period="2d", session=session, silent=True)
+        
+        # 1. Macro Metrics
+        macro = {
+            "Nifty 50": {"val": data['Close']['^NSEI'].iloc[-1], "chg": (data['Close']['^NSEI'].iloc[-1]/data['Close']['^NSEI'].iloc[-2]-1)*100},
+            "USD/INR": {"val": data['Close']['INR=X'].iloc[-1], "chg": (data['Close']['INR=X'].iloc[-1]/data['Close']['INR=X'].iloc[-2]-1)*100},
+            "Brent Crude": {"val": data['Close']['BZ=F'].iloc[-1], "chg": (data['Close']['BZ=F'].iloc[-1]/data['Close']['BZ=F'].iloc[-2]-1)*100}
+        }
+        
+        # 2. Market Breadth
+        advances = 0
+        declines = 0
+        for t in NIFTY_50_TICKERS:
+            if data['Close'][t].iloc[-1] > data['Close'][t].iloc[-2]:
                 advances += 1
-            elif curr_close < prev_close:
+            else:
                 declines += 1
-        except:
-            continue
-    return advances, declines
+                
+        return macro, advances, declines, None
+    except Exception as e:
+        return None, 0, 0, str(e)
 
-@st.cache_data(ttl=3600)
-def get_macro_metrics():
-    tickers = {"Nifty 50": "^NSEI", "USD/INR": "INR=X", "Brent Crude": "BZ=F"}
-    results = {}
-    for label, sym in tickers.items():
-        hist = yf.Ticker(sym).history(period="2d")
-        results[label] = {"val": hist['Close'].iloc[-1], "chg": (hist['Close'].iloc[-1]/hist['Close'].iloc[-2]-1)*100}
-    return results
-
-# --- Dashboard Layout ---
+# --- Layout ---
 st.title("🛡️ Macro & Sentiment Dashboard")
 
-# Top Metrics Row
-metrics = get_macro_metrics()
-cols = st.columns(len(metrics))
-for i, (name, d) in enumerate(metrics.items()):
-    cols[i].metric(name, f"{d['val']:,.2f}", f"{d['chg']:.2f}%")
+# Fetch data
+macro_metrics, adv, dec, error = get_data_safely()
 
+if error:
+    if "Rate limit" in error or "429" in error:
+        st.warning("⚠️ Yahoo Finance is currently rate-limiting this server. Showing last cached data or try again in 5 minutes.")
+    else:
+        st.error(f"Error fetching data: {error}")
+
+if macro_metrics:
+    # Top Metrics Row
+    cols = st.columns(3)
+    for i, (name, d) in enumerate(macro_metrics.items()):
+        cols[i].metric(name, f"{d['val']:,.2f}", f"{d['chg']:.2f}%")
+
+    st.divider()
+
+    # Breadth Row
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        st.subheader("Market Breadth (A/D)")
+        fig = go.Figure(go.Bar(x=[adv, dec], y=['Advances', 'Declines'], orientation='h', marker_color=['#2ecc71', '#e74c3c']))
+        fig.update_layout(height=250, margin=dict(l=10, r=10, t=10, b=10))
+        st.plotly_chart(fig, use_container_width=True)
+        st.caption(f"A/D Ratio: {adv/dec:.2f}" if dec > 0 else "N/A")
+
+# RSS Feed (Always shows regardless of data error)
 st.divider()
-
-# Market Breadth & Sentiment Row
-col_breadth, col_tech = st.columns([1, 1])
-
-with col_breadth:
-    st.subheader("Market Breadth (A/D Ratio)")
-    adv, dec = get_market_breadth()
-    fig_breadth = go.Figure(go.Bar(
-        x=[adv, dec],
-        y=['Advances', 'Declines'],
-        orientation='h',
-        marker_color=['#2ecc71', '#e74c3c']
-    ))
-    fig_breadth.update_layout(height=300, margin=dict(l=20, r=20, t=20, b=20))
-    st.plotly_chart(fig_breadth, use_container_width=True)
-    st.caption(f"Ratio: {adv/dec:.2f} (Bulls leading)" if dec > 0 else "N/A")
-
-with col_tech:
-    st.subheader("Key Price Levels")
-    # Fetching levels (Placeholder logic for Gaps/Swings)
-    nifty_hist = yf.Ticker("^NSEI").history(period="30d")
-    s_high, s_low = nifty_hist['High'].max(), nifty_hist['Low'].min()
-    st.write(f"🚩 **30D Resistance:** {s_high:,.0f}")
-    st.write(f"🟢 **30D Support:** {s_low:,.0f}")
-    st.progress(int((nifty_hist['Close'].iloc[-1] - s_low) / (s_high - s_low) * 100), text="Position in Range")
-
-# News & RSS Feed
-st.divider()
-st.subheader("🗞️ High-Signal News Feed")
-feed = feedparser.parse("https://www.livemint.com/rss/markets")
-for entry in feed.entries[:5]:
-    with st.expander(f"{entry.title}"):
-        st.write(entry.summary if 'summary' in entry else "Click link for details.")
-        st.markdown(f"[Read full article]({entry.link})")
+st.subheader("🗞️ High-Signal News")
+try:
+    feed = feedparser.parse("https://www.livemint.com/rss/markets")
+    for entry in feed.entries[:3]:
+        st.markdown(f"**{entry.title}**")
+        st.caption(f"[Read Article]({entry.link})")
+except:
+    st.write("News feed temporarily unavailable.")
